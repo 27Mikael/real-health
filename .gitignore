@@ -1,0 +1,20 @@
+gradle.properties
+*.diff
+/repo/
+/versions/**/projects/
+/versions/**/natives/
+
+/java_versions.json
+
+
+# eclipse
+/**/eclipse
+/**/.settings
+/**/.metadata
+/**/.classpath
+/**/.project
+/**/bin
+
+# gradle
+/**/.gradle
+/**/build

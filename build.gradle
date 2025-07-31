@@ -1,0 +1,887 @@
+plugins {
+    id 'de.undercouch.download'
+    id 'uk.jamierocks.propatcher' version '2.0.1' apply false
+}
+
+import net.minecraftforge.mcpconfig.tasks.*
+import net.minecraftforge.srgutils.MinecraftVersion
+import uk.jamierocks.propatcher.task.*
+
+group = 'de.oceanlabs.mcp'
+
+net.minecraftforge.mcpconfig.tasks.Utils.init()
+
+ext {
+    MC_1_16_5 = MinecraftVersion.from('1.16.5')
+    VERSIONS = subprojects.collect{it.name}.sort{ a,b -> MinecraftVersion.from(a).compareTo(MinecraftVersion.from(b)) } as List
+    NULL_OUTPUT = new OutputStream() { public void write(int b){} }
+    TIMESTAMP = (new Date()).format('yyyyMMdd.HHmmss')
+    PATH_BUILD = file('build').absolutePath
+    UPDATING = project.hasProperty('updating') || project.hasProperty('updateing') // I suck at spelling
+}
+
+logger.lifecycle('Timestamp: ' + TIMESTAMP)
+
+task downloadVersionManifest(type: Download) {
+    src 'https://launchermeta.mojang.com/mc/game/version_manifest_v2.json'
+    dest file('build/versions/version_manifest.json')
+    useETag 'all'
+    onlyIfModified true
+    quiet true
+}
+
+/* This check is fucked on anything > J8 because modules use a propriatary file format. We'd have to create an extracter 
+ * that runs in the external process.. so fuck it.
+ 
+task downloadRuntimeManifest(type: Download) {
+    src 'https://launchermeta.mojang.com/v1/products/java-runtime/2ec0cc96c44e5a76b9c8b7c39df7210883d12871/all.json'
+    dest file('build/versions/java-runtime-all.json')
+    useETag 'all'
+    onlyIfModified true
+    quiet true
+}
+
+task downloadRuntime(type:DownloadRuntime, dependsOn: downloadRuntimeManifest) {
+    json = downloadRuntimeManifest.dest
+    os = 'windows-x64'
+    doFirst {
+        downloadRuntimeManifest.dest.json.get('windows-x64').keySet().each{ dest.put(it, file('build/runtimes/' + it)) }
+    }
+}
+
+task extractRuntimeApi(type: ExtractAPI, dependsOn: downloadRuntime) {
+    doFirst {
+        downloadRuntimeManifest.dest.json.get('windows-x64').keySet().each {
+            roots.put(it, new File(downloadRuntime.dest.get(it), 'files'))
+            apis.put(it, new File(downloadRuntime.dest.get(it), 'api.json'))
+        }
+    }
+}
+*/
+
+if (project.hasProperty('old_version') && project.hasProperty('new_version')) {
+    println('Update Old: ' + project.getProperty('old_version') + ' New: ' + project.getProperty('new_version'))
+    apply from: 'update.gradle'
+}
+
+subprojects {
+    apply plugin: 'java'
+    apply plugin: 'de.undercouch.download'
+    apply plugin: 'maven-publish'
+    
+    group = rootProject.group
+    version = name
+
+    ext {
+        MC_VERSION = MinecraftVersion.from(project.name)
+        PATH_CACHED_LIBRARIES = PATH_BUILD + '/libraries/'
+        PATH_CACHED_VERSION = PATH_BUILD + '/versions/' + project.version + '/'
+        PATH_CACHED_VERSION_DATA = PATH_CACHED_VERSION + 'data/'
+        
+        PATH_INJECT = file('inject')
+        PATH_INJECT_TEMPLATE = new File(PATH_INJECT, 'package-info-template.java')
+        PATH_NATIVES = file('projects/natives')
+
+        CONFIG = file('config.json').json
+        MERGE_PATCHES = !UPDATING && CONFIG.get('merge_patches', false)
+        JAVA_TARGET = CONFIG.get('java_target', 8)
+        ENCODING = CONFIG.get('encoding', 'UTF-8')
+        FERNFLOWER = Utils.readConfig(CONFIG, 'fernflower', [:]) 
+        MERGETOOL = Utils.readConfig(CONFIG, 'merge', [
+            version: 'net.minecraftforge:mergetool:1.2.3:fatjar',
+            args: ["--client", "{client}", "--server", "{server}", "--ann", "{version}", "--output", "{output}"]
+        ])
+        INSTALLERTOOL = Utils.readConfig(CONFIG, 'installertool', [
+            version: 'net.minecraftforge:installertools:1.4.3:fatjar',
+            args: ["--task", "MAPPINGS_CSV", "--srg", "{srg}", "--client", "{client}", "--server", "{server}", "--output", "{output}"]
+        ])
+        RENAMETOOL = Utils.readConfig(CONFIG, 'rename', [
+            version: 'net.minecraftforge.lex:vignette:0.2.0.7',
+            args: ['--jar-in', '{input}', '--jar-out', '{output}', '--mapping-format', 'tsrg2', '--mappings', '{mappings}', '--fernflower-meta', '--cfg', '{libraries}']
+        ])
+        MERGEMAPTOOL = Utils.readConfig(CONFIG, 'mergemap', [
+            version: 'net.minecraftforge:installertools:1.2.0:fatjar',
+            args: ['--task', 'MERGE_MAPPING', '--left', '{mappings}', '--right', '{official}', '--right-names', 'right,left', '--classes', '--output', '{output}']
+        ])
+        MCINJECTOR = null
+        if (CONFIG.containsKey('mcinjector'))
+            MCINJECTOR = Utils.readConfig(CONFIG, 'mcinjector', [:])
+        BUNDLE_EXTRACT_JAR = null
+        if (CONFIG.containsKey('bundler_extract_jar'))
+            BUNDLE_EXTRACT_JAR = Utils.readConfig(CONFIG, 'bundler_extract_jar', [:])
+        BUNDLE_EXTRACT_LIBS = null
+        if (CONFIG.containsKey('bundler_extract_libs'))
+            BUNDLE_EXTRACT_LIBS = Utils.readConfig(CONFIG, 'bundler_extract_libs', [:])
+    }
+
+    java.toolchain.languageVersion = JavaLanguageVersion.of(JAVA_TARGET)
+
+    repositories {
+        maven {
+            name 'forge'
+            url 'https://maven.minecraftforge.net/'
+        }
+    }
+
+    task downloadJson(type: Download, dependsOn: rootProject.downloadVersionManifest) {
+        inputs.file rootProject.downloadVersionManifest.dest
+        src { downloadVersionManifest.dest.json.versions.find{ it.id == project.name }.url }
+        dest file(PATH_CACHED_VERSION + 'version.json')
+        useETag 'all'
+        onlyIfModified true
+        quiet true
+    }
+    ['client', 'server', 'client_mappings', 'server_mappings'].each { id ->
+        def name = 'download' + id.replace('_m', 'M').capitalize()
+        task "${name}"(type: Download, dependsOn: downloadJson) {
+            inputs.file downloadJson.dest
+            src { downloadJson.dest.json.downloads.get(id).url }
+            dest file(PATH_CACHED_VERSION + id + (id.contains('_') ? '.txt' : '.jar'))
+            useETag 'all'
+            onlyIfModified true
+            quiet true
+        }
+    }
+    
+    task downloadLibraries(type: DownloadLibraries, dependsOn: downloadJson) {
+        json = downloadJson.dest
+        config = CONFIG
+        dest = file(PATH_CACHED_LIBRARIES)
+    }
+    task downloadFernflower(type: DownloadTool) {
+        config FERNFLOWER, PATH_CACHED_LIBRARIES
+    }
+    task downloadMergeTool(type: DownloadTool) {
+        config MERGETOOL, PATH_CACHED_LIBRARIES
+    }
+    task downloadInstallerTool(type: DownloadTool) {
+        config INSTALLERTOOL, PATH_CACHED_LIBRARIES
+    }
+    task downloadRenameTool(type: DownloadTool) {
+        config RENAMETOOL, PATH_CACHED_LIBRARIES
+    }
+    task downloadAssets(type: DownloadAssets, dependsOn: downloadJson) {
+        json = downloadJson.dest
+        dest = file(PATH_BUILD + '/assets/')
+    }
+    if (MCINJECTOR != null) {
+        task downloadMCInjector(type: DownloadTool) {
+            config MCINJECTOR, PATH_CACHED_LIBRARIES
+        }
+        task makeEmptyFile(type: SingleFileOutput) {
+            dest file(PATH_BUILD + '/empty.txt')
+            doLast {
+                dest.text = ''
+            }
+        }
+    }
+    
+    if (BUNDLE_EXTRACT_JAR != null) {
+        task downloadBundleExtractorJar(type: DownloadTool) {
+            config BUNDLE_EXTRACT_JAR, PATH_CACHED_LIBRARIES
+        }
+        task downloadBundleExtractorLibs(type: DownloadTool) {
+            config BUNDLE_EXTRACT_LIBS, PATH_CACHED_LIBRARIES
+        }
+        task extractServer(type: ExtractBundleJar, dependsOn: [downloadBundleExtractorJar, downloadBundleExtractorLibs, downloadServer]) {
+            config BUNDLE_EXTRACT_JAR, downloadBundleExtractorJar
+            input = downloadServer.dest
+            dest = file(PATH_CACHED_VERSION + 'server.extracted.jar')
+        }
+        task extractServerLibraries(type: ExtractBundleLibs, dependsOn: [downloadBundleExtractorJar, downloadBundleExtractorLibs, downloadServer]) {
+            config BUNDLE_EXTRACT_LIBS, downloadBundleExtractorLibs
+            input = downloadServer.dest
+            dest = file(PATH_CACHED_VERSION + 'server_libraries')
+        }
+    }
+    
+    task filterClient(type: SplitJar, dependsOn: [downloadClient]) {
+        mappings = file('joined.tsrg')
+        source = downloadClient.dest
+        slim = file(PATH_CACHED_VERSION + 'client.slim.jar')
+        extra = file(PATH_CACHED_VERSION + 'client.extra.jar')
+    }
+    
+    task filterServer(type: SplitJar, dependsOn: BUNDLE_EXTRACT_JAR == null ? [downloadServer] : [extractServer]) {
+        mappings = file('joined.tsrg')
+        source = BUNDLE_EXTRACT_JAR == null ? downloadServer.dest : extractServer.dest
+        slim = file(PATH_CACHED_VERSION + 'server.slim.jar')
+        extra = file(PATH_CACHED_VERSION + 'server.extra.jar')
+    }
+
+    task mergeJars(type: MergeJar, dependsOn: [downloadMergeTool, filterClient, filterServer]) {
+        config MERGETOOL, downloadMergeTool
+        classpath.from project.files(downloadMergeTool)
+        mainClass = 'net.minecraftforge.mergetool.ConsoleMerger'
+        client filterClient.slim
+        server filterServer.slim
+        version project.version
+        dest file(PATH_CACHED_VERSION + 'joined.jar')
+    }
+    
+    task makeObfToIntermediate(type: RenameMappings, dependsOn: [downloadClientMappings]) {
+        intermediate = file('joined.tsrg')
+        if (CONFIG.official)
+            official = downloadClientMappings.dest
+        dest = file(PATH_CACHED_VERSION + 'obf_to_intermediate.tsrg')
+    }
+
+    def sides = [
+        client: [Name: 'Client', jsonlibs: true,  extra: 'Client', assets: true,  slim: filterClient, extra: filterClient, bundle: null],
+        server: [Name: 'Server', jsonlibs: false, extra: 'Server', assets: false, slim: filterServer, extra: filterServer, bundle: downloadServer],
+        joined: [Name: 'Joined', jsonlibs: true,  extra: 'Client', assets: true,  slim: mergeJars,    extra: filterClient, bundle: null]
+    ]
+    
+    sides.each{ s, child ->
+        child.libraries = task "fernflowerLibraries${child.Name}"(type: CreateFernflowerLibraries, dependsOn: [downloadLibraries, downloadJson, child.slim] + (BUNDLE_EXTRACT_LIBS == null ? [] : [extractServerLibraries])) {
+            meta = downloadJson.dest
+            config = CONFIG
+            side = s
+            root = PATH_CACHED_LIBRARIES
+            doFirst {
+                if ('server'.equals(s)) {
+                    extras += [filterServer.extra]
+                    if (BUNDLE_EXTRACT_LIBS != null)
+                        extractServerLibraries.dest.eachFileRecurse(groovy.io.FileType.FILES) { file -> extras += [file] }
+                }
+            }
+            dest file(PATH_CACHED_VERSION + s + '.fernflower.libs.txt')
+        }
+        
+        child.rename = task "rename${child.Name}"(type: RemapJar, dependsOn: [downloadRenameTool, child.slim, makeObfToIntermediate, child.libraries]) {
+            config RENAMETOOL, downloadRenameTool
+            input = 'joined'.equals(s) ? child.slim.dest : child.slim.slim
+            mappings = makeObfToIntermediate.dest
+            libraries = child.libraries.dest
+            dest = file(PATH_CACHED_VERSION + s + '.mapped.jar')
+            log = file(PATH_CACHED_VERSION + s + '.mapped.log')
+        }
+        
+        if (MCINJECTOR != null) {
+            child.mcinject = task "mcinject${child.Name}"(type: MCInjectTask, dependsOn: [downloadMCInjector, child.rename, makeEmptyFile/*, makeExceptions, fixAccessLevels*/]) {
+                config MCINJECTOR, downloadMCInjector
+                access makeEmptyFile.dest //fixAccessLevels.dest
+                constructors project.file('constructors.txt')
+                exceptions makeEmptyFile.dest //makeExceptions.dest
+                standardOutput rootProject.NULL_OUTPUT
+                log file(PATH_CACHED_VERSION + s + '.mci.log')
+                input child.rename.dest
+                dest file(PATH_CACHED_VERSION + s + '.mci.jar')
+            }
+        }
+    }
+    task renameJars(dependsOn: [renameClient, renameServer, renameJoined]){}
+
+    task extractInheritance(type: ExtractInheritance, dependsOn: [downloadLibraries, mergeJars]) {
+        input mergeJars.dest
+        inputs.file downloadJson.dest
+        dest file(PATH_CACHED_VERSION_DATA + 'inheritance.json')
+        doFirst {
+            downloadJson.dest.json.libraries.stream().map{ it?.downloads?.artifact?.path }.findAll{ it != null }.each{ library(file(PATH_CACHED_LIBRARIES + it)) }
+        }
+    }
+    task extractInheritanceNamed(type: ExtractInheritance, dependsOn: [renameJoined]) {
+        input renameJoined.dest
+        inputs.file downloadJson.dest
+        dest file(PATH_CACHED_VERSION_DATA + 'inheritance_named.json')
+        doFirst {
+            downloadJson.dest.json.libraries.stream().map{ it?.downloads?.artifact?.path }.findAll{ it != null }.each{ library(file(PATH_CACHED_LIBRARIES + it)) }
+        }
+    }
+
+    task dumpOverrides(type: DumpOverrides, dependsOn: [extractInheritance, makeObfToIntermediate]) {
+        srg makeObfToIntermediate.dest
+        meta extractInheritance.dest
+        dest file(PATH_CACHED_VERSION_DATA + 'overrides.txt')
+    }
+    
+    task projectRoot(type: Copy) {
+        from rootProject.file('templates/root_settings.gradle')
+        into file('projects/')
+        rename { 'settings.gradle' }
+        expand([version: project.name])
+    }
+
+    task extractNatives(type: ExtractNatives, dependsOn: [downloadJson, downloadLibraries]) {
+        meta downloadJson.dest
+        cache file(PATH_CACHED_LIBRARIES)
+        dest file(PATH_NATIVES)
+    }
+    
+    task verify(type: VerifyMappings, dependsOn: [mergeJars, makeObfToIntermediate]) {
+        mappings = makeObfToIntermediate.dest
+        joined = mergeJars.dest
+        o2s2idMappings = file('joined.tsrg')
+        libs = sides.joined.libraries.dest
+    }
+
+    task decompileAll
+    task projectAll
+    task projectDeleteAll
+    task projectResetAll
+    task projectApplyAll
+    task projectMakeAll
+    
+    task testDecompile
+    task testCompile
+    //task testApi
+    task testJdks(dependsOn:[testDecompile, testCompile/*, testApi*/])
+    
+    sides.each{ side, child ->
+        // Normal workflow tasks
+        child.decompile = task "decompile${child.Name}"(type: FernflowerTask, dependsOn: [/*verify,*/ downloadFernflower, child.rename, child.libraries] + (MCINJECTOR == null ? [] : [child.mcinject])) {
+            config FERNFLOWER, downloadFernflower
+            libraries = child.libraries.dest
+            input = MCINJECTOR != null ? child.mcinject.dest : child.rename.dest
+            log = file(PATH_CACHED_VERSION + side + '.decompile.log')
+            dest = file(PATH_CACHED_VERSION + side + '.decompile.jar')
+            
+        }
+        decompileAll.dependsOn(child.decompile)
+        
+        child.pkgs = task "create${child.Name}PackageInfos"(type: MakePackageInfos, dependsOn: child.decompile) {
+            input = child.decompile.dest
+            template = PATH_INJECT_TEMPLATE.exists() ? PATH_INJECT_TEMPLATE : null
+            dest = file(PATH_CACHED_VERSION + side + '.pkgs.jar')
+        }
+    }
+    
+    if (MERGE_PATCHES) {
+        task deduplicateSources(type: DeduplicateJars, dependsOn: [sides.client.decompile, sides.server.decompile, sides.joined.decompile]) {
+            clientIn = sides.client.decompile.dest
+            serverIn = sides.server.decompile.dest
+            joinedIn = sides.joined.decompile.dest
+            duplicates = file(PATH_CACHED_VERSION + 'source.duplicates.jar')
+            sides.client.slimsrc = clientOut = file(PATH_CACHED_VERSION + 'client.decompile.slim.jar')
+            sides.server.slimsrc = serverOut = file(PATH_CACHED_VERSION + 'server.decompile.slim.jar')
+            sides.joined.slimsrc = joinedOut = file(PATH_CACHED_VERSION + 'joined.decompile.slim.jar')
+        }
+        
+        task projectSharedMakeDir() {
+            doLast {
+                mkdir projectSharedReset.target
+            }
+        }
+        task projectSharedMakePatchesDir() {
+            doLast {
+                mkdir projectSharedApplyPatches.patches
+            }
+        }
+        
+        task projectSharedReset(type: ResetSourcesTask, dependsOn: [projectRoot, deduplicateSources, projectSharedMakeDir]) {
+            rootZip deduplicateSources.duplicates
+            target project.file('projects/shared')
+        }
+        task projectSharedApplyPatches(type: ApplyPatchesTask, dependsOn: [projectSharedReset, projectSharedMakePatchesDir]) {
+            target projectSharedReset.target
+            patches project.file('patches/shared')
+        }
+        task projectSharedMakePatches(type: MakePatchesTask, dependsOn: deduplicateSources) {
+            rootZip deduplicateSources.duplicates
+            target projectSharedApplyPatches.target
+            patches projectSharedApplyPatches.patches
+        }
+        task renameSourcesShared(type: RenameSources, dependsOn: [projectSharedApplyPatches, makeObfToIntermediate, downloadClientMappings]) {
+            input = projectSharedApplyPatches.target
+            srg = makeObfToIntermediate.dest
+            official = downloadClientMappings.dest
+            dest = project.file(PATH_CACHED_VERSION + "test/official/shared/src/")
+        }
+    }
+
+    sides.each{ side, child ->
+        def project_dir = project.file("projects/${side}")
+        def patches_dir = project.file("patches/${side}")
+        
+        child.delete = task "project${child.Name}Delete"(type: Delete) {
+            delete project_dir
+        }
+        projectDeleteAll.dependsOn(child.delete)
+        
+        child.project = task "project${child.Name}"(type: CreateProjectTemplate, dependsOn: [projectRoot, child.extra, child.decompile, child.pkgs] +
+                (child.jsonlibs ? [downloadJson, extractNatives] : []) +
+                (child.assets ? [downloadAssets] : []) +
+                (child.bundle != null ? [child.bundle] : [])
+        ) {
+            mustRunAfter child.delete
+            dest project_dir
+            distro side
+            template rootProject.file('templates/build.gradle')
+            if (child.jsonlibs)
+                meta downloadJson.dest
+            if (child.bundle != null)
+                bundle = child.bundle.dest
+            CONFIG?.libraries?.get(side)?.each { library "'${it}'" }
+            libraryFile child.extra.extra
+            replace '{java_target}', JAVA_TARGET + ''
+            replaceFile '{inject}', PATH_INJECT
+            replaceFile '{assets}', child.assets ? downloadAssets.dest : null
+            replaceFile '{natives}', child.jsonlibs ? extractNatives.dest : null
+            replaceFile '{merged_src}', MERGE_PATCHES ? projectSharedReset.target : null
+        }
+        projectAll.dependsOn(child.project)
+
+        child.makePkgsDir = task "project${child.Name}MakePkgsDir"() {
+            doLast {
+                mkdir child.resetPkgs.target
+            }
+        }
+        child.resetPkgs = task "project${child.Name}ResetPackages"(type: ResetSourcesTask, dependsOn: [child.makePkgsDir, child.pkgs]) {
+            mustRunAfter child.project
+            rootZip child.pkgs.dest
+            target new File(project_dir, 'src/pkginfo/java')
+        }
+        child.makeSrcDir = task "project${child.Name}MakeSrcDir"() {
+            doLast {
+                mkdir child.reset.target
+            }
+        }
+        child.reset = task "project${child.Name}Reset"(type: ResetSourcesTask, dependsOn: [projectRoot, child.resetPkgs, child.makeSrcDir, child.project, child.decompile] + (MERGE_PATCHES ? [projectSharedReset] : [])) {
+            mustRunAfter child.project
+            rootZip MERGE_PATCHES ? child.slimsrc : child.decompile.dest
+            target new File(project_dir, 'src/main/java')
+        }
+        projectResetAll.dependsOn(child.reset)
+        
+        child.makePatchesDir = task "project${child.Name}MakePatchesDir"() {
+            doLast {
+                mkdir patches_dir
+            }
+        }
+        child.apply = task "project${child.Name}ApplyPatches"(type: ApplyPatchesTask, dependsOn: [child.reset, child.makePatchesDir] + (MERGE_PATCHES ? [projectSharedApplyPatches] : [])) {
+            target new File(project_dir, 'src/main/java')
+            patches patches_dir
+        }
+        projectApplyAll.dependsOn(child.apply)
+
+        child.makePatches = task "project${child.Name}MakePatches"(type: MakePatchesTask, dependsOn: MERGE_PATCHES ? [deduplicateSources, projectSharedMakePatches] : [child.decompile]) {
+            rootZip MERGE_PATCHES ? child.slimsrc : child.decompile.dest
+            target new File(project_dir, 'src/main/java')
+            patches patches_dir
+        }
+        projectMakeAll.dependsOn child.makePatches
+        
+        child.renameSources = task "renameSources${child.Name}"(type: RenameSources, dependsOn: [child.apply, makeObfToIntermediate, downloadClientMappings] + (MERGE_PATCHES ? [renameSourcesShared] : [])) {
+            input = new File(project_dir, 'src/main/java')
+            srg = makeObfToIntermediate.dest
+            official = downloadClientMappings.dest
+            dest = project.file(PATH_CACHED_VERSION + "test/official/${side}/src/")
+        }
+        
+        // Tests
+        def testDecompileSide = task("testDecompile${child.Name}")
+        testDecompile.dependsOn(testDecompileSide)
+        def testCompileSide = task("testCompile${child.Name}")
+        testCompile.dependsOn(testCompileSide)
+        /*
+        def testApiSide = task("testApi${child.Name}")
+        testApi.dependsOn(testApiSide)
+        */
+        
+        def jdks = [
+            [name: 'hotspot8',   Name: 'HotSpot8',   version: 8,  official: false],
+            [name: 'hotspot11',  Name: 'HotSpot11',  version: 11, official: false],
+            [name: 'hotspot15',  Name: 'HotSpot15',  version: 15, official: false],
+            [name: 'hotspot16',  Name: 'HotSpot16',  version: 16, official: false],
+            [name: 'hotspot17',  Name: 'HotSpot17',  version: 17, official: false],
+            [name: 'hotspot18',  Name: 'HotSpot18',  version: 18, official: false],
+            [name: 'hotspot19',  Name: 'HotSpot19',  version: 19, official: false],
+            [name: 'hotspot20',  Name: 'HotSpot20',  version: 20, official: false],
+            [name: 'hotspot21',  Name: 'HotSpot21',  version: 21, official: false],
+            [name: 'hotspot22',  Name: 'HotSpot22',  version: 22, official: false],
+            [name: 'hotspot23',  Name: 'HotSpot23',  version: 23, official: false],
+            [name: 'hotspot24',  Name: 'HotSpot24',  version: 24, official: false],
+            [name: 'official8',  Name: 'Official8',  version: 8,  official: true ],
+            [name: 'official16', Name: 'Official16', version: 16, official: true ],
+            [name: 'official17', Name: 'Official17', version: 17, official: true ],
+            [name: 'official18', Name: 'Official18', version: 18, official: true ],
+            [name: 'official19', Name: 'Official19', version: 19, official: true ],
+            [name: 'official20', Name: 'Official20', version: 20, official: true ],
+            [name: 'official21', Name: 'Official21', version: 21, official: true ],
+            [name: 'official22', Name: 'Official22', version: 22, official: true ],
+            [name: 'official23', Name: 'Official23', version: 23, official: true ],
+            [name: 'official24', Name: 'Official24', version: 24, official: true ]
+        ]
+        jdks.findAll{ it.version >= JAVA_TARGET }.each{ jdk ->
+            def testPath = project.file(PATH_CACHED_VERSION + 'test/' + jdk.name + '/')
+            
+            def tstDecompile = task "testDecompile${child.Name}${jdk.Name}"(type: FernflowerTask, dependsOn: [downloadFernflower, child.rename, child.libraries]) {
+                config FERNFLOWER, downloadFernflower
+                javaLauncher = javaToolchains.launcherFor {
+                    languageVersion = JavaLanguageVersion.of(jdk.version)
+                }
+                libraries = child.libraries.dest
+                input = child.rename.dest
+                log = new File(testPath, side + '.decompile.log')
+                dest = new File(testPath, side + '.decompile.jar')
+                
+            }
+            def tstDecompileCheck = task "testDecompile${child.Name}${jdk.Name}Compare"(type: CompareJars, dependsOn: [tstDecompile, child.decompile]) {
+                expected = child.decompile.dest
+                actual = tstDecompile.dest
+            }
+            testDecompileSide.dependsOn(tstDecompileCheck)
+            
+            def tstCompileClean = task "testCompile${child.Name}${jdk.Name}Clean"(type: Delete) {
+                delete new File(testPath, 'classes')
+            }
+            
+            def sourceDir = jdk.official ? child.renameSources.dest : child.renameSources.input
+            def sharedDir = MERGE_PATCHES ? (jdk.official ? renameSourcesShared.dest : renameSourcesShared.input) : null
+            
+            def tstCompile = task "testCompile${child.Name}${jdk.Name}"(type: JavaCompile, dependsOn: [child.apply, tstCompileClean] + (jdk.official ? [child.renameSources] : [])) {
+                javaCompiler = javaToolchains.compilerFor {
+                    languageVersion = JavaLanguageVersion.of(jdk.version)
+                }
+                source = project.files(sourceDir)
+                if (sharedDir != null)
+                    source += project.files(sharedDir)
+                destinationDirectory = new File(testPath, 'classes')
+                options.warnings = false
+                options.encoding = ENCODING
+                options.compilerArgs += '-Xlint:none'
+                options.compilerArgs += '-Xlint:-deprecation'
+                sourceCompatibility = targetCompatibility = JAVA_TARGET <= 8 ? '1.' + JAVA_TARGET : JAVA_TARGET.toString()
+                // JavaCompile task type requires classpath to be specified before the task begins execution
+                // but the data isn't generated yet, so instead - inject the classpath as the first thing done when it begins
+                classpath = files()
+                options.fork = true
+                options.forkOptions.jvmArgs += '-Xmx6G'
+                getOptions().setFork(true)
+                doFirst {
+                    classpath = files(java.nio.file.Files.readAllLines(child.libraries.dest.toPath()).collect { file(it.substring(3)) }) // skip "-e="
+                }
+            }
+            testCompileSide.dependsOn(tstCompile)
+            
+            /*
+            def tstApi = task "testApi${child.Name}${jdk.Name}"(type: CheckAPI, dependsOn: [tstCompile, rootProject.extractRuntimeApi]) {
+                input = tstCompile.destinationDir
+                //apis.add(rootProject.extractRuntimeApi.dest)
+                dest new File(testPath, 'api_errors.json')
+            }
+            testApiSide.dependsOn(tstApi)
+            */
+        }
+    }
+
+    task generateConfiguration(type: SingleFileOutput) {
+        inputs.property('config', CONFIG)
+        dest file(PATH_CACHED_VERSION_DATA + 'config.json')
+
+        doLast {
+            def json = new groovy.json.JsonBuilder()
+            
+            if (CONFIG.official) {
+                def steps_def = [
+                    joined: [
+                        [type: 'downloadManifest'],
+                        [type: 'downloadJson'],
+                        [type: 'downloadClient'],
+                        [type: 'downloadServer'],
+                        [type: 'downloadClientMappings'],
+                        [type: 'mergeMappings', official: '{downloadClientMappingsOutput}'],
+                        [type: 'strip', name: 'stripClient', input: '{downloadClientOutput}'],
+                        [type: 'strip', name: 'stripServer', input: '{downloadServerOutput}'],
+                        [type: 'merge', client: '{stripClientOutput}', server: '{stripServerOutput}', version: project.version],
+                        [type: 'listLibraries'],
+                        [type: 'rename', input: '{mergeOutput}', libraries: '{listLibrariesOutput}', mappings: '{mergeMappingsOutput}'],
+                        [type: 'decompile', libraries: '{listLibrariesOutput}', input: '{renameOutput}'],
+                        [type: 'inject', input: '{decompileOutput}'],
+                        [type: 'patch', input: '{injectOutput}']
+                    ],
+                    client: [
+                        [type: 'downloadManifest'],
+                        [type: 'downloadJson'],
+                        [type: 'downloadClient'],
+                        [type: 'downloadClientMappings'],
+                        [type: 'mergeMappings', official: '{downloadClientMappingsOutput}'],
+                        [type: 'strip', input: '{downloadClientOutput}'],
+                        [type: 'listLibraries'],
+                        [type: 'rename', input: '{stripOutput}', libraries: '{listLibrariesOutput}', mappings: '{mergeMappingsOutput}'],
+                        [type: 'decompile', libraries: '{listLibrariesOutput}', input: '{renameOutput}'],
+                        [type: 'inject', input: '{decompileOutput}'],
+                        [type: 'patch', input: '{injectOutput}']
+                    ],
+                    server: [
+                        [type: 'downloadManifest'],
+                        [type: 'downloadJson'],
+                        [type: 'downloadServer'],
+                        [type: 'downloadClientMappings'],
+                        [type: 'mergeMappings', official: '{downloadClientMappingsOutput}'],
+                        [type: 'strip', input: '{downloadServerOutput}'],
+                        [type: 'listLibraries'],
+                        [type: 'rename', input: '{stripOutput}', libraries: '{listLibrariesOutput}', mappings: '{mergeMappingsOutput}'],
+                        [type: 'decompile', libraries: '{listLibrariesOutput}', input: '{renameOutput}'],
+                        [type: 'inject', input: '{decompileOutput}'],
+                        [type: 'patch', input: '{injectOutput}']
+                    ]
+                ]
+                def functions_def = [
+                    decompile: FERNFLOWER.findAll {it.key != 'path'},
+                    merge:     MERGETOOL .findAll {it.key != 'path'},
+                    rename:    RENAMETOOL.findAll {it.key != 'path'},
+                    mergeMappings: MERGEMAPTOOL.findAll {it.key != 'path'}
+                ]
+                def specVer = 2
+                
+                if (BUNDLE_EXTRACT_JAR != null) {
+                    specVer = 3 // Spec v3 adds 'bundle' to the listLibraries task. 
+                    functions_def['bundleExtractJar'] = BUNDLE_EXTRACT_JAR.findAll {it.key != 'path'}
+                    steps_def['joined'].add(4, [name: 'extractServer', type: 'bundleExtractJar', input: '{downloadServerOutput}'])
+                    steps_def['joined'].find{'stripServer'.equals(it.name) }['input'] = '{extractServerOutput}'
+                    
+                    steps_def['server'].add(3, [name: 'extractServer', type: 'bundleExtractJar', input: '{downloadServerOutput}'])
+                    steps_def['server'].find{'strip'.equals(it.type) }['input'] = '{extractServerOutput}'
+                    steps_def['server'].find{'listLibraries'.equals(it.type) }['bundle'] = '{downloadServerOutput}'
+                }
+
+                if (functions_def.values().any { it.java_version != null }) {
+                    specVer = 4 // Spec v4 adds the ability to set a java version to run a tool with
+                }
+                
+                json {
+                    spec specVer
+                    version project.version
+                    official CONFIG.official
+                    java_target JAVA_TARGET
+                    encoding ENCODING
+                    data {
+                        mappings 'config/joined.tsrg'
+                        inject 'config/inject/'
+                        patches {
+                            client 'patches/client/'
+                            joined 'patches/joined/'
+                            server 'patches/server/'
+                        }
+                    }
+                    steps steps_def
+                    functions functions_def
+                    libraries CONFIG.libraries
+                }
+            } else {
+                def steps_def = [
+                    joined: [
+                        [type: 'downloadManifest'],
+                        [type: 'downloadJson'],
+                        [type: 'downloadClient'],
+                        [type: 'downloadServer'],
+                        [type: 'strip', name: 'stripClient', input: '{downloadClientOutput}'],
+                        [type: 'strip', name: 'stripServer', input: '{downloadServerOutput}'],
+                        [type: 'merge', client: '{stripClientOutput}', server: '{stripServerOutput}', version: project.version],
+                        [type: 'rename', input: '{mergeOutput}'],
+                        [type: 'mcinject', input: '{renameOutput}'],
+                        [type: 'listLibraries'],
+                        [type: 'decompile', libraries: '{listLibrariesOutput}', input: '{mcinjectOutput}'],
+                        [type: 'inject', input: '{decompileOutput}'],
+                        [type: 'patch', input: '{injectOutput}']
+                    ],
+                    client: [
+                        [type: 'downloadManifest'],
+                        [type: 'downloadJson'],
+                        [type: 'downloadClient'],
+                        [type: 'strip', input: '{downloadClientOutput}'],
+                        [type: 'rename', input: '{stripOutput}'],
+                        [type: 'mcinject', input: '{renameOutput}'],
+                        [type: 'listLibraries'],
+                        [type: 'decompile', libraries: '{listLibrariesOutput}', input: '{mcinjectOutput}'],
+                        [type: 'inject', input: '{decompileOutput}'],
+                        [type: 'patch', input: '{injectOutput}']
+                    ],
+                    server: [
+                        [type: 'downloadManifest'],
+                        [type: 'downloadJson'],
+                        [type: 'downloadServer'],
+                        [type: 'strip', input: '{downloadServerOutput}'],
+                        [type: 'rename', input: '{stripOutput}'],
+                        [type: 'mcinject', input: '{renameOutput}'],
+                        [type: 'listLibraries'],
+                        [type: 'decompile', libraries: '{listLibrariesOutput}', input: '{mcinjectOutput}'],
+                        [type: 'inject', input: '{decompileOutput}'],
+                        [type: 'patch', input: '{injectOutput}']
+                    ]
+                ]
+                json {
+                    spec 1
+                    version project.version
+                    data {
+                        access 'config/access.txt'
+                        constructors 'config/constructors.txt'
+                        exceptions 'config/exceptions.txt'
+                        mappings 'config/joined.tsrg'
+                        inject 'config/inject/'
+                        statics 'config/static_methods.txt'
+                        patches {
+                            client 'patches/client/'
+                            joined 'patches/joined/'
+                            server 'patches/server/'
+                        }
+                    }
+                    steps steps_def
+                    functions {
+                        decompile CONFIG.fernflower
+                        mcinject CONFIG.mcinjector
+                        merge CONFIG.merge
+                        rename CONFIG.rename
+                    }
+                    libraries CONFIG.libraries
+                }
+            }
+            dest.text = groovy.json.JsonOutput.prettyPrint(json.toString())
+        }
+    }
+
+    task makeZip(type: Zip, dependsOn: [generateConfiguration]) {
+        archiveBaseName = rootProject.name
+        archiveVersion = project.version
+        destinationDirectory = file(PATH_BUILD + '/distributions')
+
+        from generateConfiguration
+        from(file('joined.tsrg')){ into 'config/' }
+
+        def patches = file('patches')
+        if (patches.exists()) {
+            def shared = file('patches/shared')
+            if (MERGE_PATCHES && shared.exists()) {
+                for (def side : ['client', 'server', 'joined']) {
+                    from(file('patches/' + side)) {
+                        into 'patches/' + side
+                    }
+                    from(shared) {
+                        into 'patches/' + side
+                    }
+                }
+            } else {                
+                from(patches) {
+                    into 'patches/'
+                }
+            }
+        }
+
+        if (PATH_INJECT != null && PATH_INJECT.exists()) {
+            from(PATH_INJECT) {
+                into 'config/inject/'
+            }
+        }
+    }
+    
+    task makeMappingsCsv(type: MakeMappingsCsv, dependsOn: [downloadInstallerTool, downloadClientMappings, downloadServerMappings]) {
+        config INSTALLERTOOL, downloadInstallerTool
+        classpath.from project.files(downloadInstallerTool)
+        mainClass = 'net.minecraftforge.installertools.ConsoleTool'
+        srg file('joined.tsrg')
+        client downloadClientMappings.dest
+        server downloadServerMappings.dest
+        dest file(PATH_CACHED_VERSION + 'mappings.jar')
+    }
+    
+    task mappingsCsv(type: Jar, dependsOn: [makeMappingsCsv]) {
+        archiveBaseName = rootProject.name
+        archiveVersion = project.version
+        destinationDirectory = file(PATH_BUILD + '/distributions')
+        archiveClassifier = 'srg2off'
+        from zipTree(makeMappingsCsv.dest)
+    }
+    
+
+    publishing {
+        publications {
+            if (!rootProject.hasProperty('timed_only') && (MC_VERSION.compareTo(MC_1_16_5) > 0 || !CONFIG.official)) {
+                normal(MavenPublication) {
+                    artifactId rootProject.name
+                    artifact makeZip
+                    artifact mappingsCsv
+                    pom {
+                        name = 'MCPConfig'
+                        description = 'Configuration files used for deobfuscating and modding Minecraft.'
+                        url = 'https://github.com/MinecraftForge/MCPConfig'
+                        scm {
+                            url = 'https://github.com/MinecraftForge/MCPConfig'
+                            connection = 'scm:git:git://github.com/MinecraftForge/MCPConfig.git'
+                            developerConnection = 'scm:git:git@github.com:MinecraftForge/MCPConfig.git'
+                        }
+                        issueManagement {
+                            system = 'github'
+                            url = 'https://github.com/MinecraftForge/MCPConfig/issues'
+                        }
+
+                        licenses {
+                            license {
+                                name = 'All Rights Reserved, No redistribution.'
+                                url = ''
+                            }
+                        }
+                    }
+                }
+            }
+            timed(MavenPublication) {
+                artifactId rootProject.name
+                version project.version + '-' + rootProject.TIMESTAMP
+                artifact makeZip
+                artifact mappingsCsv
+                pom {
+                    name = 'MCPConfig'
+                    description = 'Configuration files used for deobfuscating and modding Minecraft.'
+                    url = 'https://github.com/MinecraftForge/MCPConfig'
+                    scm {
+                        url = 'https://github.com/MinecraftForge/MCPConfig'
+                        connection = 'scm:git:git://github.com/MinecraftForge/MCPConfig.git'
+                        developerConnection = 'scm:git:git@github.com:MinecraftForge/MCPConfig.git'
+                    }
+                    issueManagement {
+                        system = 'github'
+                        url = 'https://github.com/MinecraftForge/MCPConfig/issues'
+                    }
+
+                    licenses {
+                        license {
+                            name = 'All Rights Reserved, No redistribution.'
+                            url = ''
+                        }
+                    }
+                }
+            }
+        }
+        repositories {
+            maven {
+                if (rootProject.hasProperty('MAVEN_USER') && rootProject.hasProperty('MAVEN_PASSWORD') && rootProject.hasProperty('MAVEN_URL')) {
+                    url rootProject.getProperty('MAVEN_URL')
+                    authentication {
+                        basic(BasicAuthentication)
+                    }
+                    credentials {
+                        username = rootProject.getProperty('MAVEN_USER') ?: 'not'
+                        password = rootProject.getProperty('MAVEN_PASSWORD') ?: 'set'
+                    }
+                } else {
+                    url 'file://' + rootProject.file('repo').getAbsolutePath()
+                }
+            }
+        }
+    }
+}
+
+def getVersionIndex(prop, default_) {
+    if (!project.hasProperty(prop))
+        return default_
+    if (!VERSIONS.contains(project.getProperty(prop)))
+        throw new IllegalArgumentException('Unknown version in ' + prop + ': ' + project.getProperty(prop) + ' Known: ' + VERSIONS.toString())
+    return VERSIONS.indexOf(project.getProperty(prop))
+}
+
+def template = project(':' + VERSIONS[0])
+def start = getVersionIndex('startVersion', 0)
+def end = getVersionIndex('endVersion', VERSIONS.size - 1)
+
+if (start > end)
+    throw new IllegalArgumentException('Invalid start and end range: ' + VERSIONS[start] + ' > ' + VERSIONS[end])
+
+template.tasks.each{t ->
+    def myTask = project.tasks.findByName(t.name) ?: project.tasks.create(t.name)
+    for (int x = start; x <= end; x++) {
+        def task = project(VERSIONS[x]).tasks.findByName(t.name)
+        if (task != null)
+            myTask.dependsOn task
+    }
+}
+
